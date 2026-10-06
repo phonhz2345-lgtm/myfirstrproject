@@ -1,0 +1,100 @@
+# Lab 2 — Web directory enumeration detection
+
+## Goal
+
+Stand up a web server on the host, point Wazuh at its access log, run a directory brute-forcing tool (`dirb`) against it, and confirm that Wazuh detects the scan.
+
+## Environment
+
+| Component | Detail |
+|---|---|
+| Host | Acer Nitro ANV15-51, Ubuntu 24.04 LTS, 16 GB RAM |
+| SIEM | Wazuh 4.14 (all-in-one) |
+| Web server | Apache 2 |
+| Scanner | dirb 2.22 |
+
+## Steps
+
+1. Installed Apache and dirb, and created two "hidden" directories so the scan would have something to find:
+
+   ```bash
+   sudo apt install -y apache2 dirb
+   sudo mkdir -p /var/www/html/admin /var/www/html/backup
+   echo "secret admin page" | sudo tee /var/www/html/admin/index.html
+   echo "backup files here"  | sudo tee /var/www/html/backup/index.html
+   ```
+
+2. Told Wazuh to monitor the Apache access log by adding this block to `/var/ossec/etc/ossec.conf`, just before `</ossec_config>`:
+
+   ```xml
+   <localfile>
+     <log_format>apache</log_format>
+     <location>/var/log/apache2/access.log</location>
+   </localfile>
+   ```
+
+   Then restarted the manager: `sudo systemctl restart wazuh-manager`.
+
+3. Ran the scan against the host:
+
+   ```bash
+   dirb http://localhost/ /usr/share/dirb/wordlists/common.txt
+   ```
+
+   dirb sent 9,224 requests and found `/admin/`, `/backup/`, `/index.html`, and `/server-status`.
+
+## Results
+
+The scan generated **3,878 alerts** of rule **31101 – "Web server 400 error code"**, all within the same second, from a single source.
+
+![Alert spike in Threat Hunting](images/web-scan-events.png)
+
+Opening one alert shows the detail a Tier 1 analyst would use to investigate:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `data.srcip` | `::1` | source of the scan (localhost) |
+| `data.url` | `/admin/wp-admin` | a path the scanner probed (WordPress admin — not even installed here) |
+| `data.id` | `404` | server response: not found |
+| `rule.groups` | `web, accesslog, attack` | Wazuh classifies this as an attack |
+| `rule.firedtimes` | `3,769` | how many times this rule fired — shows the scale |
+| full_log user-agent | `Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)` | dirb's default user-agent, a fake IE6 |
+
+![Alert detail](images/web-scan-detail.png)
+
+Wazuh also maps the alert to compliance controls: **PCI DSS 6.5 / 11.4**, **NIST 800-53 SA.11 / SI.4**, and **GDPR IV_35.7.d**.
+
+### What gave the attack away
+
+- One source produce nearly 3800 404 request that prove that it is not by a human but web scanning tool.
+- A fake Internet Explorer 6 user-agent from 2001, a classic sign of an automated scanner rather than a real browser.
+- Sequential, dictionary-style paths (`/admin/xxx`, `/admin/zipfiles`, `/admin/wp-admin`) instead of links a real user would follow.
+
+### What I learned
+
+- This is the same type of attacking method as Lab 1, brute-force, one is repeat requests to find web links, other is breaking password through many attempts.
+- Wazuh can not detect the scan until i pointed it at Apache' logs, SIEM tool only detect what it usually collect.
+- Wazuh ties technical alerts to compliance frameworks, which is how a single 404 becomes an audit-relevant event.
+
+## Troubleshooting note — recovering a broken ossec.conf
+
+While editing the config in `nano`, the file got overwritten with a stray line and the original was lost (no backup existed). Recovery:
+
+```bash
+sudo mv /var/ossec/etc/ossec.conf /var/ossec/etc/ossec.conf.broken
+sudo apt-get install --reinstall -o Dpkg::Options::="--force-confmiss" wazuh-manager
+```
+
+This restored the packaged default config without touching any alert data. After that I added the `<localfile>` block with a single `sed` command instead of a text editor, to avoid repeating the mistake:
+
+```bash
+sudo sed -i 's|</ossec_config>|  <localfile>\n    <log_format>apache</log_format>\n    <location>/var/log/apache2/access.log</location>\n  </localfile>\n</ossec_config>|' /var/ossec/etc/ossec.conf
+```
+
+**Lesson:** back up config files before editing, and prefer a targeted command over hand-editing a large file.
+
+## Possible next steps
+
+- `/server-status` was reachable (HTTP 200) — a minor information-disclosure finding worth restricting.
+- Add an active response to block a source IP after repeated web 400 errors.
+- Re-run the scan from a second machine so the source IP is not localhost.
